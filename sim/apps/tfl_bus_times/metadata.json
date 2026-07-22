@@ -1,0 +1,7 @@
+{
+    "callable": "TflBusTimesApp",
+    "name": "Bus Times",
+    "category": "Utilities",
+    "path": "apps.tfl_bus_times.app",
+    "hidden": false
+}

@@ -15,7 +15,7 @@ from tildagonos import tildagonos
 # app's own directory from __file__ with plain string ops instead.
 _APP_DIR = __file__.rsplit("/", 1)[0] if "/" in __file__ else "."
 _ENV_PATH = _APP_DIR + "/.env"
-_URGENT_SECONDS = 8 * 60
+_LED_REASSERT_SECONDS = 1
 
 
 def _load_env(path):
@@ -66,6 +66,19 @@ class TflBusTimesApp(app.App):
             self.refresh_seconds = int(env.get("TFL_REFRESH_SECONDS", "30"))
         except ValueError:
             self.refresh_seconds = 30
+        try:
+            self.urgent_min_seconds = int(env.get("TFL_URGENT_MIN_MINUTES", "7")) * 60
+        except ValueError:
+            self.urgent_min_seconds = 7 * 60
+        try:
+            self.urgent_max_seconds = int(env.get("TFL_URGENT_MAX_MINUTES", "10")) * 60
+        except ValueError:
+            self.urgent_max_seconds = 10 * 60
+        self.excluded_routes = {
+            route.strip().upper()
+            for route in env.get("TFL_EXCLUDED_ROUTES", "").split(",")
+            if route.strip()
+        }
 
         self.departures = []
         self.stop_name = None
@@ -81,15 +94,18 @@ class TflBusTimesApp(app.App):
             url += f"?app_key={self.app_key}"
         return url
 
+    def _paint_leds_red(self):
+        for i in range(tildagonos.leds.n):
+            tildagonos.leds[i] = (255, 0, 0)
+        tildagonos.leds.write()
+
     def _set_leds_urgent(self, urgent):
         if urgent == self._leds_red:
             return
         self._leds_red = urgent
         if urgent:
             eventbus.emit(PatternDisable())
-            for i in range(tildagonos.leds.n):
-                tildagonos.leds[i] = (255, 0, 0)
-            tildagonos.leds.write()
+            self._paint_leds_red()
         else:
             eventbus.emit(PatternEnable())
 
@@ -120,8 +136,14 @@ class TflBusTimesApp(app.App):
                             self.stop_name = predictions[0].get("stationName")
                         self.status = None if predictions else "No buses due"
                         self._set_leds_urgent(
-                            bool(predictions)
-                            and predictions[0].get("timeToStation", 9999) < _URGENT_SECONDS
+                            any(
+                                self.urgent_min_seconds
+                                <= p.get("timeToStation", -1)
+                                <= self.urgent_max_seconds
+                                and p.get("lineName", "").upper()
+                                not in self.excluded_routes
+                                for p in self.departures
+                            )
                         )
                     else:
                         self.status = f"TfL API error {response.status_code}"
@@ -133,7 +155,17 @@ class TflBusTimesApp(app.App):
                 self._set_leds_urgent(False)
 
             self.dirty = True
-            await asyncio.sleep(self.refresh_seconds)
+            # PatternDisable/Enable are handled asynchronously by the pattern
+            # generator app, which can race with our LED writes and leave the
+            # outer LEDs showing a stale pattern frame. Keep repainting while
+            # urgent so any such race self-corrects within a second.
+            remaining = self.refresh_seconds
+            while remaining > 0:
+                if self._leds_red:
+                    self._paint_leds_red()
+                step = min(_LED_REASSERT_SECONDS, remaining)
+                await asyncio.sleep(step)
+                remaining -= step
 
     def update(self, delta):
         if self.buttons.get(BUTTON_TYPES["CANCEL"]):

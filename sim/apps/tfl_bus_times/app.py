@@ -33,6 +33,21 @@ def _load_env(path):
     return config
 
 
+def _parse_stops(env):
+    raw = env.get("TFL_STOP_IDS") or env.get("TFL_STOP_ID") or ""
+    stops = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        stop_id, _, label = entry.partition(":")
+        stop_id = stop_id.strip()
+        label = label.strip()
+        if stop_id:
+            stops.append({"id": stop_id, "label": label or None})
+    return stops
+
+
 def _format_eta(seconds):
     minutes = seconds // 60
     return "Due" if minutes <= 0 else f"{minutes} min"
@@ -60,7 +75,9 @@ class TflBusTimesApp(app.App):
         self.buttons = Buttons(self)
 
         env = _load_env(_ENV_PATH)
-        self.stop_id = env.get("TFL_STOP_ID") or None
+        self.stops = _parse_stops(env)
+        self.stop_index = 0
+        self.stop_id = self.stops[0]["id"] if self.stops else None
         self.app_key = env.get("TFL_APP_KEY") or None
         try:
             self.refresh_seconds = int(env.get("TFL_REFRESH_SECONDS", "30"))
@@ -81,18 +98,33 @@ class TflBusTimesApp(app.App):
         }
 
         self.departures = []
-        self.stop_name = None
-        self.status = "Set TFL_STOP_ID in .env" if not self.stop_id else "Loading…"
+        self.stop_name = self.stops[0]["label"] if self.stops else None
+        self.status = "Set TFL_STOP_IDS in .env" if not self.stops else "Loading…"
         self.dirty = True
         self._leds_red = False
         self.last_updated = None
         self._tick_accum = 0
+        self._fetch_requested = False
 
-    def _arrivals_url(self):
-        url = f"https://api.tfl.gov.uk/StopPoint/{self.stop_id}/Arrivals"
+    def _arrivals_url(self, stop_id):
+        url = f"https://api.tfl.gov.uk/StopPoint/{stop_id}/Arrivals"
         if self.app_key:
             url += f"?app_key={self.app_key}"
         return url
+
+    def _switch_stop(self, direction):
+        if len(self.stops) < 2:
+            return
+        self.stop_index = (self.stop_index + direction) % len(self.stops)
+        stop = self.stops[self.stop_index]
+        self.stop_id = stop["id"]
+        self.departures = []
+        self.stop_name = stop["label"]
+        self.status = "Loading…"
+        self.last_updated = None
+        self._set_leds_urgent(False)
+        self._fetch_requested = True
+        self.dirty = True
 
     def _paint_leds_red(self):
         for i in range(tildagonos.leds.n):
@@ -109,52 +141,65 @@ class TflBusTimesApp(app.App):
         else:
             eventbus.emit(PatternEnable())
 
+    async def _refresh(self):
+        # The user can switch stops (see _switch_stop) while this fetch is
+        # in flight; if that happens, discard the result rather than
+        # applying an old stop's data under the new stop's header/LEDs.
+        target_index = self.stop_index
+        stop_id = self.stop_id
+
+        try:
+            if not wifi.status():
+                self.status = "Connecting to WiFi…"
+                self.dirty = True
+                wifi.connect()
+                await wifi.async_wait()
+
+            self.status = "Fetching…"
+            self.dirty = True
+            response = await async_helpers.unblock(
+                requests.get, _noop, self._arrivals_url(stop_id), timeout=10
+            )
+            try:
+                if self.stop_index != target_index:
+                    return
+                if response.status_code == 200:
+                    predictions = response.json()
+                    predictions.sort(key=lambda p: p.get("timeToStation", 0))
+                    self.departures = predictions[:3]
+                    self.last_updated = time.ticks_ms()
+                    if predictions and not self.stops[target_index]["label"]:
+                        self.stop_name = predictions[0].get("stationName")
+                    self.status = None if predictions else "No buses due"
+                    self._set_leds_urgent(
+                        any(
+                            self.urgent_min_seconds
+                            <= p.get("timeToStation", -1)
+                            <= self.urgent_max_seconds
+                            and p.get("lineName", "").upper()
+                            not in self.excluded_routes
+                            for p in self.departures
+                        )
+                    )
+                else:
+                    self.status = f"TfL API error {response.status_code}"
+                    self._set_leds_urgent(False)
+            finally:
+                response.close()
+        except Exception as e:
+            if self.stop_index != target_index:
+                return
+            self.status = f"Error: {e}"
+            self._set_leds_urgent(False)
+
+        self.dirty = True
+
     async def background_task(self):
-        if not self.stop_id:
+        if not self.stops:
             return
 
         while True:
-            try:
-                if not wifi.status():
-                    self.status = "Connecting to WiFi…"
-                    self.dirty = True
-                    wifi.connect()
-                    await wifi.async_wait()
-
-                self.status = "Fetching…"
-                self.dirty = True
-                response = await async_helpers.unblock(
-                    requests.get, _noop, self._arrivals_url(), timeout=10
-                )
-                try:
-                    if response.status_code == 200:
-                        predictions = response.json()
-                        predictions.sort(key=lambda p: p.get("timeToStation", 0))
-                        self.departures = predictions[:3]
-                        self.last_updated = time.ticks_ms()
-                        if predictions:
-                            self.stop_name = predictions[0].get("stationName")
-                        self.status = None if predictions else "No buses due"
-                        self._set_leds_urgent(
-                            any(
-                                self.urgent_min_seconds
-                                <= p.get("timeToStation", -1)
-                                <= self.urgent_max_seconds
-                                and p.get("lineName", "").upper()
-                                not in self.excluded_routes
-                                for p in self.departures
-                            )
-                        )
-                    else:
-                        self.status = f"TfL API error {response.status_code}"
-                        self._set_leds_urgent(False)
-                finally:
-                    response.close()
-            except Exception as e:
-                self.status = f"Error: {e}"
-                self._set_leds_urgent(False)
-
-            self.dirty = True
+            await self._refresh()
             # PatternDisable/Enable are handled asynchronously by the pattern
             # generator app, which can race with our LED writes and leave the
             # outer LEDs showing a stale pattern frame. Keep repainting while
@@ -163,6 +208,9 @@ class TflBusTimesApp(app.App):
             while remaining > 0:
                 if self._leds_red:
                     self._paint_leds_red()
+                if self._fetch_requested:
+                    self._fetch_requested = False
+                    break
                 step = min(_LED_REASSERT_SECONDS, remaining)
                 await asyncio.sleep(step)
                 remaining -= step
@@ -173,6 +221,10 @@ class TflBusTimesApp(app.App):
             self._set_leds_urgent(False)
             self.minimise()
             return False
+        if self.buttons.pressed(BUTTON_TYPES["RIGHT"]):
+            self._switch_stop(1)
+        if self.buttons.pressed(BUTTON_TYPES["LEFT"]):
+            self._switch_stop(-1)
         if self.last_updated is not None:
             self._tick_accum += delta
             if self._tick_accum >= 1000:

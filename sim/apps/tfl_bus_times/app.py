@@ -216,14 +216,18 @@ class TflBusTimesApp(app.App):
                 remaining -= step
 
     def update(self, delta):
-        if self.buttons.get(BUTTON_TYPES["CANCEL"]):
+        # Physical layout note: on the TwentyTwentySix frontboard, CANCEL is
+        # the top-left button and LEFT is the bottom-left button. Swapped
+        # here (CANCEL cycles back, LEFT quits) so cycling is on the two top
+        # buttons and quitting is on its own, per user preference.
+        if self.buttons.get(BUTTON_TYPES["LEFT"]):
             self.buttons.clear()
             self._set_leds_urgent(False)
             self.minimise()
             return False
         if self.buttons.pressed(BUTTON_TYPES["RIGHT"]):
             self._switch_stop(1)
-        if self.buttons.pressed(BUTTON_TYPES["LEFT"]):
+        if self.buttons.pressed(BUTTON_TYPES["CANCEL"]):
             self._switch_stop(-1)
         if self.last_updated is not None:
             self._tick_accum += delta

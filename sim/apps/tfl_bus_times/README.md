@@ -53,10 +53,18 @@ direction/bay — the group response's `children` list gives each one's
 
 ## Controls
 
-| Button | Action |
-|---|---|
-| LEFT / RIGHT | Cycle to the previous/next configured stop (wraps around). No-op with only one stop configured. |
-| CANCEL | Exit the app. |
+On the TwentyTwentySix frontboard, the two top buttons cycle between stops
+and the bottom-left button exits — deliberately not the badge-wide default
+of "top-left button exits", since that would put cycling and quitting right
+next to each other.
+
+| Button | Frontboard position | Action |
+|---|---|---|
+| RIGHT | Top-right | Cycle to the next configured stop (wraps around). |
+| CANCEL | Top-left | Cycle to the previous configured stop (wraps around). |
+| LEFT | Bottom-left | Exit the app. |
+
+Cycling is a no-op with only one stop configured.
 
 ## Code walkthrough (`app.py`)
 
@@ -117,12 +125,15 @@ and triggers a fresh fetch for the new stop.
   writes, leaving stale frames — repainting each second self-corrects any
   such race), and breaking out of the wait early if `_fetch_requested` was
   set by a stop switch. Exits immediately if no stops are configured.
-- **`update(delta)`** — per-frame input/redraw-decision handling: CANCEL
-  clears urgent LEDs and minimises the app; LEFT/RIGHT (edge-triggered via
-  `Buttons.pressed`, so holding a button doesn't repeat-cycle) call
-  `_switch_stop`; a 1-second accumulator marks the display dirty
-  periodically so the "Updated Ns ago" text keeps ticking over even with
-  no new data. Returns whether a redraw is needed.
+- **`update(delta)`** — per-frame input/redraw-decision handling. Button
+  roles are intentionally swapped from the badge-wide default (see
+  Controls above): LEFT (physically bottom-left) clears urgent LEDs and
+  minimises the app, while RIGHT and CANCEL (physically the two top
+  buttons, edge-triggered via `Buttons.pressed` so holding one doesn't
+  repeat-cycle) call `_switch_stop` forward/backward. A 1-second
+  accumulator marks the display dirty periodically so the "Updated Ns ago"
+  text keeps ticking over even with no new data. Returns whether a redraw
+  is needed.
 - **`draw(ctx)`** — renders the header (stop label/name, or "Next buses" if
   neither is known yet), then either the current `status` message (e.g.
   "Loading…", "No buses due", an error) or up to 3 departures as

@@ -1,0 +1,7 @@
+{
+    "callable": "FlightTrackerApp",
+    "name": "Nearest Plane",
+    "category": "Utilities",
+    "path": "apps.flight_tracker.app",
+    "hidden": false
+}

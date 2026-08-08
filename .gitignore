@@ -3,3 +3,4 @@
 **/__pycache__/
 **/.env
 !**/.env.example
+sim/apps/flight_tracker/logo_cache/

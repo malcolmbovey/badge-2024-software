@@ -1,8 +1,10 @@
 # Nearest Plane (flight_tracker)
 
 Shows live info about the nearest aircraft to your location on the badge
-screen: flight number, airline, aircraft type, origin/destination, distance,
-speed, heading and altitude.
+screen: flight number, airline (name and, where available, logo), aircraft
+type, origin/destination, distance, speed, heading and altitude. The outer
+LED ring also tints to the airline's brand colour where known (e.g. easyJet
+→ orange).
 
 ## Features
 
@@ -10,6 +12,19 @@ speed, heading and altitude.
   configurable radius of your location, and picks the closest one.
 - Distance, speed and altitude are computed/converted client-side (haversine
   distance in km, knots → km/h, heading → 16-point compass label).
+- **Airline identity** is resolved in three falling-back steps, cheapest/best
+  first:
+  1. A logo image, fetched from FlightRadar24's CDN by airline code and
+     cached locally (`logo_cache/`) so it's only downloaded once per airline
+     ever seen. This works for essentially any airline FR24 has art for, not
+     just a preset list.
+  2. If no logo is available, the full airline name from a small hand-built
+     offline lookup (`airlines.py`) — best-effort, leans towards carriers
+     seen around London/Heathrow.
+  3. If neither, the raw 3-letter ICAO code (e.g. `BAW`), same as before.
+- **Outer LEDs** switch to the airline's brand colour (also `airlines.py`,
+  hand-picked, not colour-accurate) while a flight with a known colour is on
+  screen, and revert to the normal pattern otherwise or on exit.
 - Location is currently a hardcoded lat/lon in `.env`, but reading it goes
   through a small `LocationProvider` abstraction (`location.py`) so it can be
   swapped for a real GPS sensor later without touching `app.py`.
@@ -33,6 +48,13 @@ If that turns out to be a real problem in practice, the fix doesn't require
 touching this app's code: point `FLIGHT_FEED_URL` in `.env` at a small relay
 (e.g. a Raspberry Pi or laptop on your home network running `curl_cffi` and
 re-serving the same JSON shape) instead of FR24 directly.
+
+Airline logo images are served from a *different* host (FR24's CDN /
+static asset server, not the Cloudflare-fronted feed API) and were reachable
+directly with plain headers when this was tested — no TLS-impersonation
+workaround needed there. If that changes, logo fetches just fail silently
+per-airline and `draw()` falls back to the name/code text; there's no
+separate override for the logo URLs.
 
 ### A second, separate caveat: empty-envelope responses
 
@@ -66,6 +88,12 @@ cp .env.example .env
 | `FLIGHT_RADIUS_KM` | no | `50` | Half-width (km) of the square search area around your location. |
 | `FLIGHT_REFRESH_SECONDS` | no | `60` | How often to re-poll for the nearest plane. |
 | `FLIGHT_FEED_URL` | no | FR24's live-feed URL | Override to point at a relay (see caveat above) if direct requests get blocked. |
+
+Logo images are cached under `logo_cache/` next to `app.py`, one small PNG
+(a few KB) per distinct airline ever seen — gitignored, and not currently
+size-capped, so on a badge that sees a lot of different airlines over a long
+time this will slowly grow. Fine for personal use; delete the directory to
+reclaim the space if it ever matters.
 
 If `FLIGHT_HOME_LAT`/`FLIGHT_HOME_LON` aren't set, the app shows "Set
 FLIGHT_HOME_LAT/LON in .env" and does nothing.
@@ -117,6 +145,33 @@ Pure-Python, no network/hardware dependencies — the actual HTTP call lives in
   response (skipping non-flight keys like `full_count`/`version`/`stats`,
   and any grounded aircraft), and returns the closest airborne flight with a
   `distance_km` key added, or `None`.
+- **`airline_iata(flight_number)`** — best-effort IATA airline code from the
+  first two characters of the flight number (e.g. `BA` from `BA123`), the
+  same heuristic the FlightRadarAPI reference client uses since the feed
+  doesn't give this directly. Returns `None` if there's no flight number to
+  work from (common for GA/cargo).
+- **`airline_logo_urls(icao, flight_number)`** — candidate logo image URLs,
+  best option first: the CDN URL (needs IATA, so only included if
+  `airline_iata` found one) then the ICAO-only fallback URL.
+- **`png_dimensions(data)`** / **`is_png(data)`** — read a PNG's width/height
+  straight out of its IHDR chunk header, so the app can lay out a bounding
+  box for a logo without needing a full image decoder just to ask its size.
+
+### `airlines.py`
+
+Two hand-built offline lookups, both by ICAO airline code, both optional —
+gaps just mean draw() falls back to the next thing in the chain described
+under Features above:
+
+- **`AIRLINE_NAMES`** / **`airline_name(icao)`** — full airline names.
+- **`AIRLINE_COLORS`** / **`airline_color(icao)`** — brand colours for the
+  LED ring, as `(r, g, b)` 0-255 tuples. Only covers airlines with a strong,
+  recognisable, single signature colour; deliberately doesn't try to invent
+  one for the rest.
+
+Neither table is exhaustive or guaranteed accurate (compiled by hand, not
+sourced from FR24 or any airline itself) — treat both as decorative rather
+than authoritative.
 
 ### `app.py`
 
@@ -134,17 +189,50 @@ Structured the same way as `tfl_bus_times`'s `app.py`:
   `_FEED_EMPTY_RETRIES` times if that comes back empty (see the empty-envelope
   caveat above). Raises on a non-200 response instead of retrying, since
   that's a different failure mode.
+- **`_fetch_bytes(url, headers, timeout)`** — a plainer GET used for logo
+  images: returns the raw body, or `None` on *any* failure (non-200, network
+  error, timeout). Unlike `_fetch_nearest`, a miss here is just "no logo",
+  not an app-level error.
+- **`_ensure_logo(flight)`** — makes sure a cached logo file exists locally
+  for the flight's airline. Checks `logo_cache/<icao>.png` first; if that's
+  already there (from a previous sighting of this airline), reads just its
+  24-byte header back for the dimensions and stops. Otherwise tries each URL
+  from `flight_client.airline_logo_urls` in turn, writes the first valid PNG
+  response to that cache path, and records it via `_set_logo`. Any failure
+  along the way (no ICAO code, both URLs miss, a non-PNG response) just
+  returns without setting anything — `draw()`'s fallback chain handles that.
+- **`_set_logo(path, icao, width, height)`** — records a resolved logo
+  (`logo_path`/`logo_airline_icao`/`logo_size`), pre-scaling the size to fit
+  the `_LOGO_MAX_W`×`_LOGO_MAX_H` box while preserving aspect ratio, since
+  FR24's logo art varies a lot in shape.
+- **`_paint_leds(color)`** / **`_apply_led_color(color)`** — LED control,
+  the same shape as `tfl_bus_times`'s urgent-LED handling: emits
+  `PatternDisable`/`PatternEnable` on the eventbus so the badge's normal
+  pattern generator doesn't fight over the LEDs, and is a no-op if the
+  colour hasn't changed. `color=None` means "back to the normal pattern".
 - **`_refresh()`** — ensures wifi is connected, calls `_fetch_nearest`, and
   only updates `last_updated` on a clean result — an exception (network
   error, non-200, etc.) leaves the previous "Updated Ns ago" timestamp
-  alone rather than resetting it.
+  alone rather than resetting it. On a successful result it then calls
+  `_ensure_logo` (best-effort — swallows its own exceptions, since a logo
+  failure shouldn't blank out flight data that already fetched fine) and
+  applies that airline's LED colour, or reverts the LEDs if there's no
+  flight to show.
 - **`background_task()`** — refreshes on a fixed `refresh_seconds` interval.
-  No exit-early-on-user-action logic is needed here since (unlike the bus
-  app) there's no second stop/location to switch to.
-- **`update(delta)`** — handles the CANCEL-to-exit button and a 1-second
-  dirty-flag tick so the "Updated Ns ago" footer keeps counting up.
+  Between refreshes, repaints the current LED colour once a second while a
+  colour override is active — same reasoning as `tfl_bus_times`: the pattern
+  generator runs asynchronously and can otherwise leave a stale frame on
+  screen after a race.
+- **`update(delta)`** — handles the CANCEL-to-exit button (also reverting
+  the LEDs before minimising) and a 1-second dirty-flag tick so the
+  "Updated Ns ago" footer keeps counting up.
+- **`_draw_airline(ctx, flight, cy)`** — the airline row: draws the cached
+  logo image if one's resolved *and* matches the flight currently on screen
+  (the icao check stops a stale logo from a previous flight flashing up
+  before this cycle's `_ensure_logo` resolves), otherwise falls back to
+  `airlines.airline_name` or, failing that, the raw ICAO code.
 - **`draw(ctx)`** — renders the header, then either the current `status`
   message (`Loading…`, `No planes nearby`, an error) or the nearest flight's
-  details stacked top-to-bottom: flight number, airline/aircraft type,
-  route, distance (large, accent colour), speed/heading, altitude, and
-  finally the "Updated Ns ago" footer.
+  details stacked top-to-bottom: flight number, `_draw_airline`, aircraft
+  type + route, distance (large, accent colour), speed/heading, altitude,
+  and finally the "Updated Ns ago" footer.

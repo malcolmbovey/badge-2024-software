@@ -26,6 +26,23 @@ FEED_HEADERS = {
     "referer": "https://www.flightradar24.com/",
 }
 
+# Airline logo images. Unlike the feed above, these are served straight off
+# FR24's CDN / static asset host rather than the Cloudflare-fronted feed API,
+# and were reachable directly (no TLS-impersonation workaround needed) when
+# this was tested. Primary URL needs the airline's IATA code (derived from
+# the flight number -- see airline_iata()); the fallback only needs ICAO, for
+# flights where a flight number isn't available.
+AIRLINE_LOGO_CDN_URL = "https://cdn.flightradar24.com/assets/airlines/logotypes/{}_{}.png"
+AIRLINE_LOGO_FALLBACK_URL = "https://www.flightradar24.com/static/images/data/operators/{}_logo0.png"
+
+LOGO_HEADERS = {
+    "accept": "image/png,image/*;q=0.8,*/*;q=0.5",
+    "user-agent": FEED_HEADERS["user-agent"],
+    "referer": "https://www.flightradar24.com/",
+}
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
 # Field indices within each flight's array in the feed response.
 _LATITUDE = 1
 _LONGITUDE = 2
@@ -95,6 +112,43 @@ def compass_point(degrees):
         return None
     index = int((degrees % 360) / 22.5 + 0.5) % 16
     return _COMPASS_POINTS[index]
+
+
+def airline_iata(flight_number):
+    """Best-effort IATA airline code from a flight number, e.g. 'BA' from
+    'BA123' -- the same heuristic the FlightRadarAPI reference client uses,
+    since the feed doesn't give the airline's IATA code directly."""
+    if not flight_number or len(flight_number) < 2:
+        return None
+    return flight_number[:2]
+
+
+def airline_logo_urls(airline_icao, flight_number):
+    """Candidate logo image URLs for an airline, best option first. Returns
+    an empty list if there's no ICAO code to work with at all."""
+    if not airline_icao:
+        return []
+    urls = []
+    iata = airline_iata(flight_number)
+    if iata:
+        urls.append(AIRLINE_LOGO_CDN_URL.format(iata, airline_icao))
+    urls.append(AIRLINE_LOGO_FALLBACK_URL.format(airline_icao))
+    return urls
+
+
+def png_dimensions(data):
+    """Return (width, height) read straight from a PNG's IHDR chunk, or
+    (None, None) if `data` doesn't start with a valid PNG signature. Avoids
+    needing a full image decoder just to lay out a bounding box."""
+    if len(data) < 24 or data[:8] != _PNG_SIGNATURE:
+        return None, None
+    width = (data[16] << 24) | (data[17] << 16) | (data[18] << 8) | data[19]
+    height = (data[20] << 24) | (data[21] << 16) | (data[22] << 8) | data[23]
+    return width, height
+
+
+def is_png(data):
+    return len(data) >= 8 and data[:8] == _PNG_SIGNATURE
 
 
 def _get(entry, index, default=None):

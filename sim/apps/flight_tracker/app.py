@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 
 import app
@@ -7,14 +8,18 @@ import requests
 import wifi
 from app_components import utils
 from events.input import BUTTON_TYPES, Buttons
+from system.eventbus import eventbus
+from system.patterndisplay.events import PatternDisable, PatternEnable
+from tildagonos import tildagonos
 
-from . import flight_client
+from . import airlines, flight_client
 from .location import HardcodedLocation
 
 # os.path isn't available on-device (only in the desktop sim), so derive the
 # app's own directory from __file__ with plain string ops instead.
 _APP_DIR = __file__.rsplit("/", 1)[0] if "/" in __file__ else "."
 _ENV_PATH = _APP_DIR + "/.env"
+_LOGO_CACHE_DIR = _APP_DIR + "/logo_cache"
 
 # FR24's feed endpoint sits behind a load balancer that can occasionally
 # route a request to a backend that answers 200 with a well-formed but empty
@@ -26,6 +31,19 @@ _ENV_PATH = _APP_DIR + "/.env"
 # attempts.
 _FEED_EMPTY_RETRIES = 3
 _FEED_RETRY_DELAY_SECONDS = 1.5
+
+# Airline logo images are drawn into a box of at most this size (pixels),
+# preserving aspect ratio -- FR24's logo assets are wordmarks and vary a lot
+# in shape (e.g. 150x18 vs 112x45), so a fixed box would either crop or
+# leave odd gaps.
+_LOGO_MAX_W = 140
+_LOGO_MAX_H = 26
+
+# Same idea as tfl_bus_times' LED handling: the pattern generator app runs
+# asynchronously and can race with our LED writes, leaving a stale pattern
+# frame on screen. Repainting on this cadence while a colour override is
+# active self-corrects any such race within a second.
+_LED_REASSERT_SECONDS = 1
 
 
 def _load_env(path):
@@ -53,6 +71,18 @@ def _build_location(env):
     # a GPS sensor is wired up -- nothing below this point needs to change,
     # since it only ever calls .get() on whatever LocationProvider it's given.
     return HardcodedLocation(lat, lon)
+
+
+def _ensure_dir(path):
+    try:
+        os.mkdir(path)
+    except OSError:
+        pass  # already exists
+
+
+def _scaled_logo_size(width, height):
+    scale = min(_LOGO_MAX_W / width, _LOGO_MAX_H / height)
+    return width * scale, height * scale
 
 
 def _format_ago(seconds):
@@ -121,6 +151,32 @@ class FlightTrackerApp(app.App):
         self.last_updated = None
         self._tick_accum = 0
 
+        # Set once a logo is confirmed cached for the *currently shown*
+        # airline (see _ensure_logo) -- logo_airline_icao guards against
+        # briefly showing a stale logo left over from the previous flight.
+        self.logo_path = None
+        self.logo_airline_icao = None
+        self.logo_size = (None, None)
+
+        self._led_color = None
+
+    async def _fetch_bytes(self, url, headers, timeout):
+        """GET a URL and return its raw body, or None on any failure (non-200,
+        network error, timeout). Used for logo images, where a miss should
+        just fall back to text rather than surface as an app-level error."""
+        try:
+            response = await async_helpers.unblock(
+                requests.get, _noop, url, headers=headers, timeout=timeout,
+            )
+        except Exception:
+            return None
+        try:
+            if response.status_code != 200:
+                return None
+            return response.content
+        finally:
+            response.close()
+
     async def _fetch_nearest(self, lat, lon):
         """Fetch the feed and return the nearest flight (or None), retrying
         a few times if a response comes back with no usable flight entries.
@@ -151,6 +207,62 @@ class FlightTrackerApp(app.App):
             self.dirty = True
             await asyncio.sleep(_FEED_RETRY_DELAY_SECONDS)
 
+    def _set_logo(self, path, icao, width, height):
+        if not width or not height:
+            return
+        self.logo_path = path
+        self.logo_airline_icao = icao
+        self.logo_size = _scaled_logo_size(width, height)
+        self.dirty = True
+
+    async def _ensure_logo(self, flight):
+        """Best-effort: make sure a cached logo image exists locally for this
+        flight's airline, downloading and caching it if not already present.
+        Failures of any kind (no ICAO code, no network, a 404 from both
+        candidate URLs, a non-PNG response) are silently swallowed -- draw()
+        falls back to the airline name/code text when there's no logo.
+        """
+        icao = flight["airline_icao"]
+        if not icao:
+            return
+
+        path = _LOGO_CACHE_DIR + "/" + icao + ".png"
+        if utils.path_isfile(path):
+            with open(path, "rb") as f:
+                header = f.read(24)
+            self._set_logo(path, icao, *flight_client.png_dimensions(header))
+            return
+
+        for url in flight_client.airline_logo_urls(icao, flight["flight_number"]):
+            data = await self._fetch_bytes(url, flight_client.LOGO_HEADERS, 8)
+            if data is None or not flight_client.is_png(data):
+                continue
+
+            width, height = flight_client.png_dimensions(data)
+            if not width:
+                continue
+
+            _ensure_dir(_LOGO_CACHE_DIR)
+            with open(path, "wb") as f:
+                f.write(data)
+            self._set_logo(path, icao, width, height)
+            return
+
+    def _paint_leds(self, color):
+        for i in range(tildagonos.leds.n):
+            tildagonos.leds[i] = color
+        tildagonos.leds.write()
+
+    def _apply_led_color(self, color):
+        if color == self._led_color:
+            return
+        self._led_color = color
+        if color is not None:
+            eventbus.emit(PatternDisable())
+            self._paint_leds(color)
+        else:
+            eventbus.emit(PatternEnable())
+
     async def _refresh(self):
         lat, lon = self.location.get()
 
@@ -168,6 +280,16 @@ class FlightTrackerApp(app.App):
             self.status = None if self.flight else "No planes nearby"
         except Exception as e:
             self.status = f"Error: {e}"
+            self.flight = None
+
+        if self.flight is not None:
+            try:
+                await self._ensure_logo(self.flight)
+            except Exception:
+                pass  # best-effort -- draw() falls back to name/code text
+            self._apply_led_color(airlines.airline_color(self.flight["airline_icao"]))
+        else:
+            self._apply_led_color(None)
 
         self.dirty = True
 
@@ -177,7 +299,13 @@ class FlightTrackerApp(app.App):
 
         while True:
             await self._refresh()
-            await asyncio.sleep(self.refresh_seconds)
+            remaining = self.refresh_seconds
+            while remaining > 0:
+                if self._led_color is not None:
+                    self._paint_leds(self._led_color)
+                step = min(_LED_REASSERT_SECONDS, remaining)
+                await asyncio.sleep(step)
+                remaining -= step
 
     def update(self, delta):
         # No per-stop cycling like tfl_bus_times (there's only ever one
@@ -185,6 +313,7 @@ class FlightTrackerApp(app.App):
         # exiting the app rather than being repurposed.
         if self.buttons.pressed(BUTTON_TYPES["CANCEL"]):
             self.buttons.clear()
+            self._apply_led_color(None)
             self.minimise()
             return False
         if self.last_updated is not None:
@@ -197,13 +326,24 @@ class FlightTrackerApp(app.App):
             return True
         return False
 
+    def _draw_airline(self, ctx, flight, cy):
+        icao = flight["airline_icao"]
+        width, height = self.logo_size
+        if self.logo_path and self.logo_airline_icao == icao and width:
+            ctx.image(self.logo_path, -width / 2, cy - height / 2, width, height)
+            return
+
+        name = airlines.airline_name(icao) or icao or "—"
+        ctx.rgb(0.85, 0.85, 0.85).font_size = 14
+        ctx.move_to(0, cy).text(name)
+
     def draw(self, ctx):
         ctx.save()
         ctx.rgb(0.02, 0.05, 0.08).rectangle(-120, -120, 240, 240).fill()
         ctx.text_align = ctx.CENTER
 
         ctx.rgb(0.4, 0.75, 1).font_size = 16
-        ctx.move_to(0, -95).text("Nearest Plane")
+        ctx.move_to(0, -98).text("Nearest Plane")
 
         if self.status:
             ctx.rgb(1, 1, 1).font_size = 20
@@ -212,26 +352,25 @@ class FlightTrackerApp(app.App):
             flight = self.flight
 
             ctx.rgb(1, 1, 1).font_size = 24
-            ctx.move_to(0, -68).text(flight["label"])
+            ctx.move_to(0, -70).text(flight["label"])
 
-            airline = flight["airline_icao"] or "—"
-            aircraft = flight["aircraft_type"] or "—"
-            ctx.rgb(0.8, 0.8, 0.8).font_size = 14
-            ctx.move_to(0, -48).text(f"{airline} · {aircraft}")
+            self._draw_airline(ctx, flight, cy=-44)
 
-            ctx.rgb(0.9, 0.9, 0.9).font_size = 20
-            ctx.move_to(0, -22).text(_format_route(flight["origin"], flight["destination"]))
+            aircraft = flight["aircraft_type"]
+            route = _format_route(flight["origin"], flight["destination"])
+            ctx.rgb(0.9, 0.9, 0.9).font_size = 18
+            ctx.move_to(0, -16).text(f"{aircraft} · {route}" if aircraft else route)
 
             ctx.rgb(0.24, 0.88, 0.54).font_size = 22
-            ctx.move_to(0, 8).text(f"{flight['distance_km']:.1f} km")
+            ctx.move_to(0, 12).text(f"{flight['distance_km']:.1f} km")
 
             speed = _format_speed(flight["ground_speed_kt"])
             direction = _format_direction(flight["heading"])
             ctx.rgb(1, 1, 1).font_size = 15
-            ctx.move_to(0, 32).text(f"{speed} · {direction}")
+            ctx.move_to(0, 36).text(f"{speed} · {direction}")
 
             ctx.rgb(0.6, 0.6, 0.6).font_size = 13
-            ctx.move_to(0, 54).text(_format_altitude(flight["altitude_ft"]))
+            ctx.move_to(0, 58).text(_format_altitude(flight["altitude_ft"]))
 
         if self.last_updated is not None:
             elapsed = time.ticks_diff(time.ticks_ms(), self.last_updated) // 1000

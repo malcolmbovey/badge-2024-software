@@ -16,6 +16,17 @@ from .location import HardcodedLocation
 _APP_DIR = __file__.rsplit("/", 1)[0] if "/" in __file__ else "."
 _ENV_PATH = _APP_DIR + "/.env"
 
+# FR24's feed endpoint sits behind a load balancer that can occasionally
+# route a request to a backend that answers 200 with a well-formed but empty
+# envelope (no flight entries at all, regardless of bounds) -- observed
+# directly while building this app, and indistinguishable from "genuinely no
+# traffic nearby" without retrying. Each request already sends
+# "Connection: close" (see the requests library), so a retry is a fresh
+# connection and usually lands on a working backend within a couple of
+# attempts.
+_FEED_EMPTY_RETRIES = 3
+_FEED_RETRY_DELAY_SECONDS = 1.5
+
 
 def _load_env(path):
     config = {}
@@ -110,6 +121,36 @@ class FlightTrackerApp(app.App):
         self.last_updated = None
         self._tick_accum = 0
 
+    async def _fetch_nearest(self, lat, lon):
+        """Fetch the feed and return the nearest flight (or None), retrying
+        a few times if a response comes back with no usable flight entries.
+        See _FEED_EMPTY_RETRIES above for why that's not necessarily "no
+        planes nearby". Raises on a non-200 response or a request error --
+        the caller (_refresh) treats that as distinct from a clean empty
+        result, since it shouldn't bump last_updated.
+        """
+        url = flight_client.feed_url(lat, lon, self.radius_km, self.feed_base_url)
+
+        for attempt in range(_FEED_EMPTY_RETRIES + 1):
+            response = await async_helpers.unblock(
+                requests.get, _noop, url,
+                headers=flight_client.FEED_HEADERS, timeout=10,
+            )
+            try:
+                if response.status_code != 200:
+                    raise RuntimeError(f"FR24 error {response.status_code}")
+                feed = response.json()
+            finally:
+                response.close()
+
+            flight = flight_client.find_nearest(feed, lat, lon)
+            if flight is not None or attempt == _FEED_EMPTY_RETRIES:
+                return flight
+
+            self.status = f"Fetching… (retry {attempt + 1})"
+            self.dirty = True
+            await asyncio.sleep(_FEED_RETRY_DELAY_SECONDS)
+
     async def _refresh(self):
         lat, lon = self.location.get()
 
@@ -122,21 +163,9 @@ class FlightTrackerApp(app.App):
 
             self.status = "Fetching…"
             self.dirty = True
-            url = flight_client.feed_url(lat, lon, self.radius_km, self.feed_base_url)
-            response = await async_helpers.unblock(
-                requests.get, _noop, url,
-                headers=flight_client.FEED_HEADERS, timeout=10,
-            )
-            try:
-                if response.status_code == 200:
-                    feed = response.json()
-                    self.flight = flight_client.find_nearest(feed, lat, lon)
-                    self.last_updated = time.ticks_ms()
-                    self.status = None if self.flight else "No planes nearby"
-                else:
-                    self.status = f"FR24 error {response.status_code}"
-            finally:
-                response.close()
+            self.flight = await self._fetch_nearest(lat, lon)
+            self.last_updated = time.ticks_ms()
+            self.status = None if self.flight else "No planes nearby"
         except Exception as e:
             self.status = f"Error: {e}"
 

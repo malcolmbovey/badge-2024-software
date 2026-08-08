@@ -356,21 +356,22 @@ class FlightTrackerApp(app.App):
 
             self._draw_airline(ctx, flight, cy=-44)
 
-            aircraft = flight["aircraft_type"]
             route = _format_route(flight["origin"], flight["destination"])
-            ctx.rgb(0.9, 0.9, 0.9).font_size = 18
-            ctx.move_to(0, -16).text(f"{aircraft} · {route}" if aircraft else route)
+            ctx.rgb(1, 1, 1).font_size = 22
+            ctx.move_to(0, -10).text(route)
 
             ctx.rgb(0.24, 0.88, 0.54).font_size = 22
-            ctx.move_to(0, 12).text(f"{flight['distance_km']:.1f} km")
+            ctx.move_to(0, 16).text(f"{flight['distance_km']:.1f} km")
 
             speed = _format_speed(flight["ground_speed_kt"])
             direction = _format_direction(flight["heading"])
             ctx.rgb(1, 1, 1).font_size = 15
-            ctx.move_to(0, 36).text(f"{speed} · {direction}")
+            ctx.move_to(0, 40).text(f"{speed} · {direction}")
 
+            aircraft = flight["aircraft_type"]
+            altitude = _format_altitude(flight["altitude_ft"])
             ctx.rgb(0.6, 0.6, 0.6).font_size = 13
-            ctx.move_to(0, 58).text(_format_altitude(flight["altitude_ft"]))
+            ctx.move_to(0, 62).text(f"{aircraft} · {altitude}" if aircraft else altitude)
 
         if self.last_updated is not None:
             elapsed = time.ticks_diff(time.ticks_ms(), self.last_updated) // 1000

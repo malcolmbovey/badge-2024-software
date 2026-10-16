@@ -1,0 +1,7 @@
+{
+    "callable": "HalloweenApp",
+    "name": "Halloween",
+    "category": "Games",
+    "path": "apps.halloween.app",
+    "hidden": false
+}

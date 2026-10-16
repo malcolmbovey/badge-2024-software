@@ -396,7 +396,10 @@ class Context:
         return self
 
     def text(self, s):
-        self._emit(f'text "{s}"')
+        # Escape for the ctx text protocol; the real badge calls ctx_text()
+        # directly, so backslashes and quotes must survive as literals.
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        self._emit(f'text "{escaped}"')
         if self.a11y:
             self.a11y.collect_text(s)
         return self
